@@ -20,3 +20,22 @@ redis：
 + 高效的 I/O 模型 (I/O Multiplexing & Single-Threaded Event Loop) ：Redis 使用单线程事件循环配合 I/O 多路复用技术，让单个线程可以同时处理多个网络连接上的 I/O 事件（如读写），避免了多线程模型中的上下文切换和锁竞争问题。虽然是单线程，但结合内存操作的高效性和 I/O 多路复用，使得 Redis 能轻松处理大量并发请求（Redis 线程模型会在后文中详细介绍到）。
 + 优化的内部数据结构 (Optimized Data Structures) ：Redis 提供多种数据类型（如 String, List, Hash, Set, Sorted Set 等），其内部实现采用高度优化的编码方式（如 ziplist, quicklist, skiplist, hashtable 等）。Redis 会根据数据大小和类型动态选择最合适的内部编码，以在性能和空间效率之间取得最佳平衡。
 + 简洁高效的通信协议 (Simple Protocol - RESP) ：Redis 使用的是自己设计的 RESP (REdis Serialization Protocol) 协议。这个协议实现简单、解析性能好，并且是二进制安全的。客户端和服务端之间通信的序列化/反序列化开销很小，有助于提升整体的交互速度。
+
+
+redis处理做混存还能实现：java的redisseion包封装了一系列方便的api
+1. 延迟队列：zset，过期时间最短的在最前面
+2. 分布式锁：
+3. 消息队列：stream
+
+
+在spring cache中，redis默认使用String类型，java队形通过序列化城json字符串进行存储，cacheManager里面去配置。
+如果需要别的特殊的转换类型，要单独写cachemanager
+
+zset的底层是，跳表+hash
+跳表：范围查询
+hash：查成员分数
+
+跳表的思想和mysql innodb的b+树索引类似，都是上层索引+底层有序链表的设计
+b+树更适合磁盘上的查询（尽量少io，一次多读数据）b+树矮，io次数少
+优点：实现简单，没有复杂的自旋和平衡，有序范围查询高效
+缺点：空间开销比较大
