@@ -260,3 +260,137 @@ Java: compareAndSetState(expect, update)
 - `lock` 前缀：锁定缓存行（或总线），保证多核下的原子性
 
 CAS 是一条 CPU 指令，天然原子，不需要软件层面加锁。
+
+---
+
+## 十、ConcurrentHashMap
+
+### 1.7 vs 1.8 实现对比
+
+| | JDK 1.7 | JDK 1.8 |
+|---|---|---|
+| 结构 | Segment 数组 + HashEntry 数组 | Node 数组 + 链表/红黑树 |
+| 锁粒度 | Segment（分段锁，ReentrantLock） | 桶级别（synchronized + CAS） |
+| 并发度 | 默认 16（Segment 数量） | 等于数组长度 |
+| get 加锁 | 不加锁（volatile 读） | 不加锁（volatile 读） |
+
+---
+
+### put 流程（JDK 1.8）
+
+1. 计算 hash（spread 函数）
+2. 桶为空 → **CAS** 写入新节点
+3. 桶不为空 → **synchronized** 锁住头节点，遍历链表/红黑树插入
+4. 链表长度 ≥ 8 → 树化
+5. 更新计数（baseCount + CounterCell）
+
+**为什么不全用 CAS？** 链表/树的遍历+修改是多步操作，CAS 只能保证单个变量的原子性，无法保护整个遍历过程。
+
+---
+
+### get 流程（JDK 1.8）—— 全程无锁
+
+```java
+public V get(Object key) {
+    int h = spread(key.hashCode());
+    Node<K,V>[] tab; Node<K,V> e;
+    if ((tab = table) != null &&
+        (e = tabAt(tab, (n - 1) & h)) != null) {  // volatile 读桶头节点
+        if (e.hash == h && key.equals(e.key))
+            return e.val;                           // 头节点命中
+        if (e.hash < 0)                             // ForwardingNode 或 TreeBin
+            return e.find(h, key).val;
+        while ((e = e.next) != null) {              // 遍历链表
+            if (e.hash == h && key.equals(e.key))
+                return e.val;
+        }
+    }
+    return null;  // key 不存在
+}
+```
+
+**为什么不加锁也安全？**
+- Node 的 `val` 和 `next` 都是 **volatile**，保证读到最新值
+- 数组槽位通过 `Unsafe.getObjectVolatile` 读取
+- volatile 保证可见性 + 禁止重排序，读操作不需要互斥
+
+---
+
+### 为什么不允许 null key/value
+
+`get(key)` 返回 null 时：
+- HashMap：可能是 key 不存在，也可能是 value 就是 null（有歧义）
+- ConcurrentHashMap：**一定是 key 不存在**（无歧义）
+
+HashMap 可以用 `containsKey` 再确认，但并发下 `containsKey` 和 `get` 之间状态可能被其他线程修改，判断不可靠。禁止 null 从根源消除歧义，一次 get 调用就能明确语义。
+
+---
+
+### size() 实现：分段计数（类似 LongAdder）
+
+```java
+// 计数结构
+private transient volatile long baseCount;
+private transient volatile CounterCell[] counterCells;
+```
+
+- put 时先 CAS 更新 baseCount
+- CAS 失败（竞争激烈）→ 分散到 CounterCell 数组的某个槽
+- size() 时：baseCount + 所有 CounterCell 的值求和
+
+**为什么不用单个 AtomicLong？** 高并发下所有线程 CAS 同一个变量会疯狂重试，性能极差。分散到多个 Cell 减少竞争。
+
+---
+
+### 扩容：多线程协助迁移
+
+1. 触发扩容的线程创建新数组（2倍），从后往前迁移桶
+2. 其他线程 put 时发现正在扩容（遇到 ForwardingNode），加入帮忙迁移
+3. 每个线程领取一段桶区间（stride），各自负责自己那段
+4. 迁移完的桶放一个 ForwardingNode 标记，get 遇到它就去新数组查
+
+---
+
+### 1.8 为什么用 synchronized 而不是 ReentrantLock？
+
+- JDK 1.6 后 synchronized 大量优化（偏向锁→轻量级锁→重量级锁），性能接近 ReentrantLock
+- synchronized 是 JVM 内置的，不需要额外 Lock 对象，每个桶省一个对象头的内存
+- 锁粒度已经细化到单个桶，竞争概率低，大多数走偏向锁或轻量级锁
+- 代码更简洁，不需要手动 lock/unlock
+
+---
+
+### 复合操作的原子性
+
+单个 get、put 是线程安全的，但"先检查再操作"不是原子的：
+
+```java
+// ❌ 错误写法：两步之间可能被其他线程插入
+if (!map.containsKey(key)) {
+    map.put(key, value);
+}
+
+// ✅ 正确写法：使用原子方法
+map.putIfAbsent(key, value);
+map.computeIfAbsent(key, k -> new Value());
+map.compute(key, (k, v) -> ...);
+map.merge(key, value, remappingFunction);
+```
+
+---
+
+### ConcurrentHashMap vs Collections.synchronizedMap()
+
+| | ConcurrentHashMap | synchronizedMap |
+|---|---|---|
+| 锁粒度 | 桶级别 | 整个 map 一把锁 |
+| 并发读 | 无锁（volatile） | 读也要加锁 |
+| 迭代器 | 弱一致性，不抛 CME | 迭代时修改抛 ConcurrentModificationException |
+| 性能 | 高并发下远优 | 所有操作串行化 |
+| null | 不允许 | 允许 |
+
+---
+
+### 面试回答模板
+
+> ConcurrentHashMap 在 1.8 中用 Node 数组 + 链表/红黑树，抛弃了 1.7 的 Segment 分段锁。put 时桶为空用 CAS，桶不为空用 synchronized 锁住头节点，锁粒度细化到单个桶。get 全程无锁，靠 volatile 保证可见性。计数用 baseCount + CounterCell 分段计数，类似 LongAdder。扩容时支持多线程协助迁移。不允许 null key/value 是为了消除并发下 get 返回 null 的歧义。
